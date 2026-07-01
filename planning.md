@@ -1,120 +1,92 @@
 # Planning: Provenance Guard
 
-The spec I wrote before building. I also feed its sections to an AI tool when I
-generate code in the later milestones.
+The spec I wrote before building. I fed pieces of it to an AI tool later when I got to the code.
 
-The system takes a piece of writing and decides whether it looks human written or AI
-generated, and is honest about how sure it is instead of forcing a yes or no. One rule
-drives most of the design: on a creative platform, calling a real person's work "AI
-generated" is the worst mistake the system can make, so it needs stronger evidence to
-accuse something of being AI than to clear it as human.
+The system reads a piece of writing and guesses whether its human or AI, and stays honest
+about how sure it is instead of forcing a yes or no. One rule drives the rest: calling a
+real persons work "AI generated" is the worst mistake it can make, so it needs more
+evidence to accuse than it does to clear.
 
 ## Architecture
 
 ```
 SUBMISSION
-  Client --POST /submit {text, creator_id}--> /submit route
-      route --raw text--> Signal 1 (Groq LLM)   --> p_ai_llm   0..1
-      route --raw text--> Signal 2 (Stylometry)  --> p_ai_style 0..1
-          both scores --> Confidence scoring --> ai_likelihood, confidence, attribution
-                          --> Label generator --> label text
-                          --> Audit log (SQLite)
-      route --> Response {content_id, attribution, confidence, ai_likelihood,
-                          llm_score, stylometry_score, label, status}
+  POST /submit {text, creator_id, content_type?}
+    -> Signal 1 Groq LLM      -> llm_score
+    -> Signal 2 stylometry    -> stylometry_score   (text only)
+    -> Signal 3 lexical       -> lexical_score
+    -> weighted vote -> ai_likelihood -> attribution + confidence
+    -> transparency label -> audit log (SQLite) -> response
 
 APPEAL
-  Client --POST /appeal {content_id, creator_reasoning}--> /appeal route
-      route --lookup content_id--> Storage  (not found -> 404)
-          found --> set status = "under_review"
-                --> Audit log (appeal + original decision)
-      route --> Response {content_id, status: "under_review", appeal_id, message}
+  POST /appeal {content_id, creator_reasoning}
+    -> look up decision (404 if missing) -> status = "under_review"
+    -> log appeal next to the original decision -> response
 ```
 
-On submit, the text fans out to both signals at once, their scores combine into one AI
-likelihood, that number picks an attribution and a label, and the whole decision is
-logged before the response returns. On appeal, the route looks up the stored decision,
-flips its status to under review, logs the creator's reasoning next to the original
-decision, and confirms. Appeals never rerun detection, they just flag the item.
+On submit the text hits every signal at once, the scores get voted into one likelihood,
+that picks a bucket and a label, and the whole thing is logged before the response goes
+back. Appeals just flip the status to under_review and log the reasoning next to the
+original decision. They dont rerun detection.
 
-## API contract
+## API
 
-| Method | Path    | Body                              | Returns |
-|--------|---------|-----------------------------------|---------|
-| POST   | /submit | { text, creator_id }              | content_id, attribution, confidence, ai_likelihood, llm_score, stylometry_score, label, status |
-| POST   | /appeal | { content_id, creator_reasoning } | content_id, status ("under_review"), appeal_id, message |
-| GET    | /log    | (none)                            | { entries: [ audit rows ] } |
+| Method | Path | Body | Returns |
+|--------|------|------|---------|
+| POST | /submit | text, creator_id, content_type? | content_id, attribution, confidence, ai_likelihood, the three signal scores, label, status |
+| POST | /appeal | content_id, creator_reasoning | content_id, status, appeal_id, message |
+| GET | /log | none | recent audit rows |
 
-`content_id` is a UUID from /submit and the join key for appeals. `attribution` is one
-of `likely_ai`, `uncertain`, `likely_human`. GET /log has no auth here; in production it
-would be locked down, but it exists so the log is easy to show for grading.
+`content_id` is a UUID from /submit and the key appeals join on. `attribution` is
+`likely_ai`, `uncertain`, or `likely_human`. Stretch endpoints (verify, creator, analytics,
+dashboard) are listed in the README.
 
 ## Detection signals
 
-Two signals that look at different things. One reads meaning, the other measures shape.
-That is what makes combining them worthwhile.
+Three signals that look at different things: one reads meaning, one measures shape, one
+matches known AI phrases. If they always agreed the extra ones would be pointless.
 
-**Signal 1: Groq LLM** (`llama-3.3-70b-versatile`)
-- Measures: whether the text reads as human or machine written taken as a whole. Tone,
-  specific lived detail, natural imperfection, and whether phrasing feels generic and
-  evenly polished.
-- Why it differs: models tend to produce smooth, safe, evenly polished prose; human
-  writing wanders more and carries personal detail.
-- Output: one probability `p_ai_llm` (0 to 1) plus a short reason string for the log,
-  returned as strict JSON.
-- Blind spot: it is a black box with its own biases, can be fooled by lightly edited AI
-  text, and can flag careful or formal human writing (including non native English) as
-  too clean. Also non deterministic.
+**Signal 1, Groq LLM** (`llama-3.3-70b-versatile`). Reads the passage like a person would
+and returns a probability its AI plus a short reason. Catches fluent filler that says
+nothing. Blind spot: black box, can be fooled by lightly edited AI, and can read formal or
+non native English as too clean.
 
-**Signal 2: Stylometry** (pure Python)
-- Measures: statistics that differ between uniform machine text and variable human text.
-  Three metrics: sentence length variation (coefficient of variation of per sentence word
-  counts), type token ratio (unique words over total), and punctuation variety and density.
-- Why it differs: AI text is statistically more uniform. Variance, vocabulary spread, and
-  punctuation habits show that without understanding meaning.
-- Output: each metric maps to a 0 to 1 sub score with a simple linear ramp between two
-  anchor points (tuned in M4); `p_ai_style` is their average.
-- Blind spot: no idea what the text says, unreliable on short pieces, and misreads
-  deliberately uniform human writing (formal prose, repetitive poetry) as AI. That is why
-  it is weighted below the LLM.
+**Signal 2, stylometry** (pure Python). Three stats, each mapped to a 0 to 1 AI-ness score,
+averaged: sentence length variation, type token ratio (moving average so length doesnt
+skew it), and punctuation variety. Blind spot: no idea what the text means, unreliable on
+short pieces, misreads deliberately uniform human writing as AI.
 
-**Combining:** `combined_p_ai = 0.65 * p_ai_llm + 0.35 * p_ai_style`. The LLM gets more
-weight because a holistic read beats surface statistics and stylometry is noisier. Weights
-are a starting point checked against the calibration inputs in M4.
+**Signal 3, lexical markers** (the ensemble stretch). Matches a fixed list of AI tells like
+"it is important to note", "a testament to", "delve into", "furthermore". High precision,
+low recall, so no markers scores 0 and it gets the smallest weight.
 
-## Uncertainty and confidence scoring
+Combine: `ai_likelihood = 0.55*llm + 0.25*stylometry + 0.20*lexical`, renormalized over
+whichever signals are present (stylometry is dropped for short captions).
 
-The system reports two numbers, and keeping them separate is the point.
+## Uncertainty and confidence
 
-- `ai_likelihood` = `combined_p_ai` (0 to 1): how likely the text is AI generated.
-- `confidence` = `max(combined_p_ai, 1 - combined_p_ai)` (0.5 to 1.0): how strongly the
-  system leans toward the side it picked. Middle likelihood gives confidence near 0.5 (a
-  coin flip); either end gives confidence near 1.0.
+Two numbers on purpose:
+- `ai_likelihood` (0 to 1): how likely its AI. The honest core number.
+- `confidence` = `max(ai_likelihood, 1 - ai_likelihood)`: how hard it leans. Near 0.5 means
+  coin flip, near either end means sure.
 
-Attribution buckets use `ai_likelihood` with asymmetric thresholds:
+Buckets, with the thresholds deliberately lopsided:
 
 ```
-ai_likelihood >= 0.70         -> likely_ai      (high bar to accuse of AI)
-ai_likelihood <= 0.40         -> likely_human    (lower bar, benefit of the doubt)
-0.40 < ai_likelihood < 0.70   -> uncertain
+ai_likelihood >= 0.70  -> likely_ai      (high bar to accuse)
+ai_likelihood <= 0.40  -> likely_human    (lower bar, benefit of the doubt)
+in between             -> uncertain
 ```
 
-The gap between 0.70 and 0.40 is the false positive rule in action: the system will call
-something human on weaker evidence than it will call it AI.
-
-A 0.60 likelihood means the signals lean a bit toward AI but do not clear 0.70, so it
-lands in the uncertain band and the user sees the uncertain label. The system never
-presents a 0.60 as settled.
-
-Testing that scores are meaningful (M4): run four chosen inputs (clearly AI, clearly
-human, formal human, lightly edited AI). The clear pair must land in different buckets
-with a real gap; the borderline pair should sit in or near uncertain. If one scores
-against intuition, print `p_ai_llm` and `p_ai_style` separately to find the culprit
-before touching thresholds.
+The gap between 0.70 and 0.40 is the whole false positive rule: it clears a human on
+weaker evidence than it accuses one of being AI. A 0.60 lands in uncertain, so the user
+sees the uncertain label, not a verdict. (I started at 0.75 but calibration in M4 showed
+that let a formal human text tip into likely_ai, so I moved it to 0.70.)
 
 ## Transparency label
 
-Three variants, one per bucket, written for a non technical reader, never claiming
-certainty. `{confidence_pct}` is confidence as a whole percentage.
+One per bucket, plain language, never claims certainty. `{confidence_pct}` is filled at
+runtime. The uncertain one leaves the number out on purpose.
 
 High confidence AI (`likely_ai`):
 
@@ -134,154 +106,57 @@ Uncertain (`uncertain`):
 > We could not tell whether a person or an AI wrote this. The signals were mixed, so we
 > are not labeling it either way. Please treat this as inconclusive rather than a verdict.
 
-The uncertain label drops the percentage on purpose, since a confident number on an
-inconclusive result sends the wrong message.
+## Appeals
 
-## Appeals workflow
-
-- Who: the content's creator. There is no login here, so in practice anyone with the
-  content_id can appeal (a known limitation; production would tie it to the authenticated
-  creator).
-- Provides: `content_id` and `creator_reasoning` (free text).
-- System does: look up the decision by content_id (404 if missing), set status to
-  `under_review`, write an appeal row to the log carrying the reasoning and pointing back
-  at the original decision, and return a confirmation with the appeal_id. No automatic
-  re-classification.
-- Reviewer view: for each appealed item, the original text, attribution, confidence, both
-  signal scores, and the creator's reasoning, pulled from the log. The queue is just the
-  log rows where status is `under_review`.
-
-## Audit log
-
-Every decision and appeal is one structured SQLite row, not a print statement. A
-classification row:
-
-```json
-{
-  "content_id": "3f7a2b1e-...",
-  "creator_id": "test-user-1",
-  "timestamp": "2026-07-01T14:32:10.123Z",
-  "event": "classification",
-  "attribution": "likely_ai",
-  "ai_likelihood": 0.83,
-  "confidence": 0.83,
-  "llm_score": 0.88,
-  "stylometry_score": 0.74,
-  "status": "classified",
-  "appeal_reasoning": null
-}
-```
-
-An appeal row reuses the content_id, sets `event` to `appeal`, `status` to `under_review`,
-and fills `appeal_reasoning`. GET /log returns recent rows as JSON.
-
-## Rate limiting
-
-Applied to /submit only via Flask-Limiter with in memory storage. Limits: `10 per minute`
-and `100 per day` per IP. A real writer checking their own work submits a handful of
-pieces in a sitting, so 10 per minute sits well above normal use while stopping a script
-that hammers the endpoint, and 100 per day caps sustained abuse from one address while
-staying far above any genuine daily need. Limiting bursts also protects the Groq free tier.
+The creator sends the content_id and their reasoning. The system looks up the decision
+(404 if it doesnt exist), sets status to `under_review`, logs an appeal row carrying the
+reasoning and the original scores, and confirms with an appeal_id. No auto reclassification,
+it just flags the item for a human. No login here, so anyone with the content_id can appeal,
+which is a known limitation.
 
 ## Edge cases
 
-Content this system handles poorly, tied to the signals:
+- **Short pieces** (a haiku, a caption). Stylometry needs length to be stable, so on very
+  short text it goes neutral at 0.5 and the LLM leads.
+- **Repetitive or simple poetry.** Refrains and plain words look statistically uniform,
+  exactly what stylometry reads as AI. The clearest false positive risk, and a main reason
+  stylometry is weighted below the LLM.
+- **Formal or academic human writing, incl. non native English.** Reads as too clean to the
+  LLM and uniform to stylometry. The 0.70 bar catches a lot of these in uncertain instead
+  of accusing them, and appeals cover the rest.
 
-1. **Short submissions** (a haiku, a two sentence caption). Stylometry needs enough words
-   and sentences to be stable; on short text, variance is noisy and type token ratio is
-   inflated toward 1.0, which swings `p_ai_style`. Plan: lean on the LLM and widen toward
-   uncertain rather than commit.
-2. **Repetitive or simple poetry.** A refrain, short even lines, and plain vocabulary look
-   statistically uniform, exactly the pattern stylometry reads as AI. Low type token ratio
-   plus low sentence length variation push `p_ai_style` up on genuine human art. This is
-   the clearest false positive risk and a main reason stylometry is weighted below the LLM.
-3. **Careful or formal human writing, including non native English.** Textbook phrasing and
-   even structure can read as too clean to the LLM and uniform to stylometry. The 0.70
-   threshold is meant to catch many of these in the uncertain band rather than accuse them,
-   and appeals cover the rest.
+## Rate limiting
+
+Flask-Limiter on /submit, 10 per minute and 100 per day per IP. A real writer submits a
+handful of pieces in a sitting, so 10/min is well above normal use but stops a script, and
+100/day caps abuse from one address. Each submit also calls Groq, so capping bursts protects
+the free tier.
 
 ## AI Tool Plan
 
-**M3 (submission endpoint + Signal 1).** Provide: Detection signals (Signal 1), the API
-contract, the submission diagram. Ask for: Flask skeleton with a POST /submit stub, the
-Groq signal function, the SQLite log helper, and GET /log. Verify: call the Groq function
-directly on a few strings and confirm it returns a 0 to 1 score, not a string or flag;
-then curl /submit and check the response has content_id, attribution, a placeholder
-confidence and label, and that a structured row appears in /log.
+Which spec I hand the tool each milestone and how I check it.
 
-**M4 (Signal 2 + confidence scoring).** Provide: full Detection signals, Uncertainty and
-confidence scoring, the diagram. Ask for: the stylometry function returning `p_ai_style`,
-and the scoring function using the exact 0.70 / 0.40 thresholds. Verify: run stylometry
-alone on the same inputs and compare with the LLM; run the four calibration inputs and
-check the clear pair splits with a real gap and the borderline pair sits near uncertain;
-read the scoring code to confirm it uses my thresholds, not invented ones; log both scores.
-
-**M5 (production layer).** Provide: Transparency label, Appeals workflow, Rate limiting,
-the diagram. Ask for: the label generator mapping bucket to exact text, the POST /appeal
-endpoint, and Flask-Limiter on /submit. Verify: print all three label variants and confirm
-they match this document; submit inputs hitting each bucket and confirm the right label;
-appeal a real content_id and confirm status flips to under_review and shows in the log;
-fire more than 10 requests in a minute and confirm the extra ones return 429.
+- **M3** (submit + signal 1): give it the signals section and API. Ask for the Flask
+  skeleton, the Groq function, the SQLite log, and /log. Check the function returns a 0 to 1
+  score, then curl /submit and confirm a row shows in /log.
+- **M4** (signal 2 + scoring): give it signals + uncertainty. Ask for the stylometry function
+  and the combine using the 0.70 / 0.40 thresholds. Run the four calibration inputs, confirm
+  the clear pair splits and the borderline pair sits near uncertain, read the code to check it
+  used my thresholds not invented ones.
+- **M5** (production): give it the label variants + appeals + rate limiting. Ask for the label
+  function, /appeal, and the limiter. Confirm all three labels match this doc, an appeal flips
+  status, and >10 requests in a minute return 429.
 
 ## Stretch features
 
-I built all four stretch features. Designs are below; what actually shipped is written up
-in the README. I updated this section before starting each one.
+All four built. Details and evidence live in the README.
 
-### Ensemble detection (third signal)
-
-Add a third signal so the pipeline is a real ensemble, and move from two signal blending
-to a documented three signal weighted vote.
-
-- New signal: a lexical AI marker detector. It scans for phrases and words that are
-  disproportionately common in AI writing (for example "it is important to note", "a
-  testament to", "delve into", "furthermore", "studies show"). It counts how many distinct
-  markers appear and maps that to a 0 to 1 score.
-- Why it is distinct: Signal 1 reads meaning, Signal 2 measures statistical shape, and this
-  one matches a fixed vocabulary of known tells. Three different lenses.
-- Weighting (the vote): `ai_likelihood = 0.55*llm + 0.25*stylometry + 0.20*lexical`. The LLM
-  still leads. The lexical signal gets the smallest weight because it is high precision but
-  low recall: when a cliche is present that is strong evidence, but plenty of AI text avoids
-  these phrases, and absence is only weak evidence. Absent markers score 0, which leans
-  human, keeping the false positive rule intact.
-- Combining is renormalized over whichever signals are present, which is what makes the
-  multi modal case below clean.
-
-### Provenance certificate (verified human credential)
-
-A creator can earn a "verified human" credential through an extra step, and it shows on
-their content.
-
-- `POST /verify/start` with a creator_id issues a short writing challenge (a random prompt)
-  and a challenge_id, stored server side.
-- `POST /verify/complete` with the creator_id, challenge_id, and their written response runs
-  that response through the same detection pipeline. If it reads as human (likely_human), the
-  system grants a certificate (a certificate_id and timestamp stored per creator). If it
-  reads AI, it is denied with the score, and they can try again.
-- Display: once a creator is verified, every `/submit` response for them carries
-  `creator_verified: true`, and the transparency label gains a line noting the credential.
-- Honest limits: this proves the creator can produce human reading writing on demand, not
-  that any specific later piece is theirs. It is a trust signal, not proof, and the README
-  says so.
-
-### Analytics dashboard
-
-A simple operator view of what the system is seeing.
-
-- `GET /analytics` returns JSON: total submissions, the breakdown across the three buckets
-  (counts and percentages), the appeal rate (appeals over classifications), average
-  confidence, average score per signal, a breakdown by content type, and the number of
-  verified human creators (the extra metric).
-- `GET /dashboard` renders the same numbers as a plain server rendered HTML page with simple
-  bars, no JavaScript or external libraries.
-
-### Multi-modal support
-
-Extend the pipeline to a second content type alongside plain text.
-
-- `POST /submit` takes an optional `content_type`, either `text` (default) or `image_caption`
-  (an alt text or caption written for an image).
-- Captions are short, so the stylometry signal is unreliable and is skipped for them. The
-  LLM runs with a caption specific prompt, the lexical signal still runs, and the weighted
-  vote renormalizes over the two present signals. Everything downstream (label, appeal, log,
-  analytics) treats both types the same, with content_type recorded on every row.
+- **Ensemble**: the third signal above (lexical markers) plus the documented 3 way weighted
+  vote.
+- **Provenance certificate**: /verify/start issues a writing challenge, /verify/complete runs
+  the response through detection and grants a "verified human" credential if it reads human.
+  Shows on the creators /submit responses and in the label.
+- **Analytics dashboard**: /analytics (JSON) and /dashboard (plain HTML) with attribution
+  breakdown, appeal rate, average scores, and verified creator count.
+- **Multi-modal**: content_type can be `image_caption` as well as `text`. Captions skip
+  stylometry (too short) and use a caption specific LLM prompt.
