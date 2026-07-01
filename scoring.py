@@ -6,12 +6,21 @@ to call something AI than to call it human (0.40). On a creative platform, false
 accusing a real writer is the worst outcome, so the system leans toward not
 accusing when the evidence is thin.
 
-Milestone 3 feeds this the single LLM score as a provisional likelihood. Milestone 4
-adds combine_signals() so the likelihood is the weighted mix of both signals.
+The AI likelihood itself is the weighted mix of the two signals (combine_signals).
+The LLM carries more weight because a holistic read is stronger evidence than
+surface statistics, and stylometry is the noisier of the two on real text.
 """
 
-AI_THRESHOLD = 0.75
+AI_THRESHOLD = 0.70
 HUMAN_THRESHOLD = 0.40
+
+LLM_WEIGHT = 0.65
+STYLOMETRY_WEIGHT = 0.35
+
+
+def combine_signals(p_llm, p_style):
+    """Weighted mix of the two signal scores into one AI likelihood (0..1)."""
+    return round(LLM_WEIGHT * p_llm + STYLOMETRY_WEIGHT * p_style, 3)
 
 
 def attribution_from_likelihood(ai_likelihood):

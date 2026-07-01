@@ -11,8 +11,12 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 import db
-from scoring import attribution_from_likelihood, confidence_from_likelihood
-from signals import groq_signal
+from scoring import (
+    attribution_from_likelihood,
+    combine_signals,
+    confidence_from_likelihood,
+)
+from signals import groq_signal, stylometry_signal
 
 load_dotenv()
 
@@ -50,13 +54,14 @@ def submit():
     content_id = str(uuid.uuid4())
     timestamp = _now()
 
-    # Signal 1: Groq LLM. Returns p_ai (0..1) and a short reason.
+    # Signal 1: Groq LLM (semantic). Signal 2: stylometry (structural).
     llm = groq_signal(text)
     llm_score = llm["p_ai"]
+    style = stylometry_signal(text)
+    stylometry_score = style["p_ai"]
 
-    # Milestone 3 uses the single LLM signal as a provisional AI likelihood.
-    # Milestone 4 replaces this with the weighted mix of both signals.
-    ai_likelihood = llm_score
+    # AI likelihood is the weighted mix of both signals.
+    ai_likelihood = combine_signals(llm_score, stylometry_score)
     attribution = attribution_from_likelihood(ai_likelihood)
     confidence = confidence_from_likelihood(ai_likelihood)
     label = f"[provisional] {attribution} - final label text added in Milestone 5"
@@ -71,7 +76,7 @@ def submit():
             "ai_likelihood": ai_likelihood,
             "confidence": confidence,
             "llm_score": llm_score,
-            "stylometry_score": None,
+            "stylometry_score": stylometry_score,
             "reason": llm["reason"],
             "status": status,
             "created_at": timestamp,
@@ -88,7 +93,7 @@ def submit():
             "ai_likelihood": ai_likelihood,
             "confidence": confidence,
             "llm_score": llm_score,
-            "stylometry_score": None,
+            "stylometry_score": stylometry_score,
             "status": status,
             "appeal_reasoning": None,
         }
@@ -101,7 +106,7 @@ def submit():
             "confidence": confidence,
             "ai_likelihood": ai_likelihood,
             "llm_score": llm_score,
-            "stylometry_score": None,
+            "stylometry_score": stylometry_score,
             "label": label,
             "status": status,
         }

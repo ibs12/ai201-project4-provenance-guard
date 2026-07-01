@@ -93,15 +93,15 @@ The system reports two numbers, and keeping them separate is the point.
 Attribution buckets use `ai_likelihood` with asymmetric thresholds:
 
 ```
-ai_likelihood >= 0.75         -> likely_ai      (high bar to accuse of AI)
+ai_likelihood >= 0.70         -> likely_ai      (high bar to accuse of AI)
 ai_likelihood <= 0.40         -> likely_human    (lower bar, benefit of the doubt)
-0.40 < ai_likelihood < 0.75   -> uncertain
+0.40 < ai_likelihood < 0.70   -> uncertain
 ```
 
-The gap between 0.75 and 0.40 is the false positive rule in action: the system will call
+The gap between 0.70 and 0.40 is the false positive rule in action: the system will call
 something human on weaker evidence than it will call it AI.
 
-A 0.60 likelihood means the signals lean a bit toward AI but do not clear 0.75, so it
+A 0.60 likelihood means the signals lean a bit toward AI but do not clear 0.70, so it
 lands in the uncertain band and the user sees the uncertain label. The system never
 presents a 0.60 as settled.
 
@@ -196,7 +196,7 @@ Content this system handles poorly, tied to the signals:
    plus low sentence length variation push `p_ai_style` up on genuine human art. This is
    the clearest false positive risk and a main reason stylometry is weighted below the LLM.
 3. **Careful or formal human writing, including non native English.** Textbook phrasing and
-   even structure can read as too clean to the LLM and uniform to stylometry. The 0.75
+   even structure can read as too clean to the LLM and uniform to stylometry. The 0.70
    threshold is meant to catch many of these in the uncertain band rather than accuse them,
    and appeals cover the rest.
 
@@ -211,7 +211,7 @@ confidence and label, and that a structured row appears in /log.
 
 **M4 (Signal 2 + confidence scoring).** Provide: full Detection signals, Uncertainty and
 confidence scoring, the diagram. Ask for: the stylometry function returning `p_ai_style`,
-and the scoring function using the exact 0.75 / 0.40 thresholds. Verify: run stylometry
+and the scoring function using the exact 0.70 / 0.40 thresholds. Verify: run stylometry
 alone on the same inputs and compare with the LLM; run the four calibration inputs and
 check the clear pair splits with a real gap and the borderline pair sits near uncertain;
 read the scoring code to confirm it uses my thresholds, not invented ones; log both scores.
