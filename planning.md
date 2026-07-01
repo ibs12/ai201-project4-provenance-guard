@@ -222,3 +222,66 @@ endpoint, and Flask-Limiter on /submit. Verify: print all three label variants a
 they match this document; submit inputs hitting each bucket and confirm the right label;
 appeal a real content_id and confirm status flips to under_review and shows in the log;
 fire more than 10 requests in a minute and confirm the extra ones return 429.
+
+## Stretch features
+
+I built all four stretch features. Designs are below; what actually shipped is written up
+in the README. I updated this section before starting each one.
+
+### Ensemble detection (third signal)
+
+Add a third signal so the pipeline is a real ensemble, and move from two signal blending
+to a documented three signal weighted vote.
+
+- New signal: a lexical AI marker detector. It scans for phrases and words that are
+  disproportionately common in AI writing (for example "it is important to note", "a
+  testament to", "delve into", "furthermore", "studies show"). It counts how many distinct
+  markers appear and maps that to a 0 to 1 score.
+- Why it is distinct: Signal 1 reads meaning, Signal 2 measures statistical shape, and this
+  one matches a fixed vocabulary of known tells. Three different lenses.
+- Weighting (the vote): `ai_likelihood = 0.55*llm + 0.25*stylometry + 0.20*lexical`. The LLM
+  still leads. The lexical signal gets the smallest weight because it is high precision but
+  low recall: when a cliche is present that is strong evidence, but plenty of AI text avoids
+  these phrases, and absence is only weak evidence. Absent markers score 0, which leans
+  human, keeping the false positive rule intact.
+- Combining is renormalized over whichever signals are present, which is what makes the
+  multi modal case below clean.
+
+### Provenance certificate (verified human credential)
+
+A creator can earn a "verified human" credential through an extra step, and it shows on
+their content.
+
+- `POST /verify/start` with a creator_id issues a short writing challenge (a random prompt)
+  and a challenge_id, stored server side.
+- `POST /verify/complete` with the creator_id, challenge_id, and their written response runs
+  that response through the same detection pipeline. If it reads as human (likely_human), the
+  system grants a certificate (a certificate_id and timestamp stored per creator). If it
+  reads AI, it is denied with the score, and they can try again.
+- Display: once a creator is verified, every `/submit` response for them carries
+  `creator_verified: true`, and the transparency label gains a line noting the credential.
+- Honest limits: this proves the creator can produce human reading writing on demand, not
+  that any specific later piece is theirs. It is a trust signal, not proof, and the README
+  says so.
+
+### Analytics dashboard
+
+A simple operator view of what the system is seeing.
+
+- `GET /analytics` returns JSON: total submissions, the breakdown across the three buckets
+  (counts and percentages), the appeal rate (appeals over classifications), average
+  confidence, average score per signal, a breakdown by content type, and the number of
+  verified human creators (the extra metric).
+- `GET /dashboard` renders the same numbers as a plain server rendered HTML page with simple
+  bars, no JavaScript or external libraries.
+
+### Multi-modal support
+
+Extend the pipeline to a second content type alongside plain text.
+
+- `POST /submit` takes an optional `content_type`, either `text` (default) or `image_caption`
+  (an alt text or caption written for an image).
+- Captions are short, so the stylometry signal is unreliable and is skipped for them. The
+  LLM runs with a caption specific prompt, the lexical signal still runs, and the weighted
+  vote renormalizes over the two present signals. Everything downstream (label, appeal, log,
+  analytics) treats both types the same, with content_type recorded on every row.

@@ -2,14 +2,18 @@
 
 A backend that a creative sharing platform can plug into to check whether a piece of
 writing looks human written or AI generated. It does not try to be a perfect detector,
-because perfect AI detection is not a solved problem. Instead it combines two independent
-signals, reports how confident it is in plain language, and gives creators a way to
-appeal when it gets them wrong.
+because perfect AI detection is not a solved problem. Instead it runs an ensemble of three
+independent signals, reports how confident it is in plain language, and gives creators a
+way to appeal when it gets them wrong.
 
 One idea drives the whole design: on a platform for creative work, calling a real
 person's writing "AI generated" is the worst mistake the system can make. So it needs
 stronger evidence to accuse something of being AI than it does to clear it as human, and
 every decision comes with an appeal path.
+
+All four stretch features are also built: a third detection signal (ensemble), a verified
+human credential, an analytics dashboard, and multi-modal support for image captions. They
+are documented in their own section below.
 
 ## How it works (architecture overview)
 
@@ -17,28 +21,30 @@ Here is the path a single submission takes, from the text coming in to the label
 reader sees:
 
 ```
-POST /submit {text, creator_id}
+POST /submit {text, creator_id, content_type?}
    |
    v
- raw text fans out to two signals at once
-   |-> Signal 1: Groq LLM      -> llm_score        (0..1, semantic read)
-   |-> Signal 2: Stylometry    -> stylometry_score (0..1, structural stats)
+ raw text fans out to the signals at once
+   |-> Signal 1: Groq LLM       -> llm_score        (0..1, semantic read)
+   |-> Signal 2: Stylometry     -> stylometry_score (0..1, structural stats)  [text only]
+   |-> Signal 3: Lexical markers -> lexical_score    (0..1, known AI phrases)
    |
    v
- combine: ai_likelihood = 0.65*llm_score + 0.35*stylometry_score
+ weighted vote: ai_likelihood = 0.55*llm + 0.25*stylometry + 0.20*lexical
+   (renormalized over whichever signals are present)
    |
    v
  attribution bucket (asymmetric thresholds) + confidence number
    |
    v
- transparency label text chosen from the bucket
+ transparency label text (plus a credential line if the creator is verified)
    |
    v
  write a structured row to the SQLite audit log
    |
    v
- response {content_id, attribution, confidence, ai_likelihood,
-           llm_score, stylometry_score, label, status}
+ response {content_id, content_type, attribution, confidence, ai_likelihood,
+           llm_score, stylometry_score, lexical_score, label, creator_verified, status}
 ```
 
 The appeal flow is shorter. A creator sends `POST /appeal` with the `content_id` they
@@ -49,14 +55,27 @@ human. The full diagram for both flows is in [planning.md](planning.md) under Ar
 
 ## API
 
+Required endpoints:
+
 | Method | Path    | Body                              | Returns |
 |--------|---------|-----------------------------------|---------|
-| POST   | /submit | `{ text, creator_id }`            | content_id, attribution, confidence, ai_likelihood, llm_score, stylometry_score, label, status |
+| POST   | /submit | `{ text, creator_id, content_type? }` | content_id, content_type, attribution, confidence, ai_likelihood, llm_score, stylometry_score, lexical_score, label, creator_verified, status |
 | POST   | /appeal | `{ content_id, creator_reasoning }` | content_id, status (`under_review`), appeal_id, message |
 | GET    | /log    | none                              | `{ entries: [ audit rows ] }` |
 
-`GET /log` has no auth here. In a real system it would be locked down, but it exists so
-the audit log is easy to read for grading.
+Stretch endpoints:
+
+| Method | Path                    | Body / param                          | Returns |
+|--------|-------------------------|---------------------------------------|---------|
+| POST   | /verify/start           | `{ creator_id }`                      | challenge_id, prompt, instructions |
+| POST   | /verify/complete        | `{ creator_id, challenge_id, text }`  | verified, certificate_id (if granted), ai_likelihood, message |
+| GET    | /creator/&lt;creator_id&gt;  | none                             | creator_id, verified_human, certificate_id |
+| GET    | /analytics              | none                                  | detection patterns, appeal rate, verified creator count |
+| GET    | /dashboard              | none                                  | HTML dashboard view |
+
+`content_type` is optional and defaults to `text`. The other value is `image_caption`.
+`GET /log`, `/analytics`, and `/dashboard` have no auth here. In a real system they would
+be locked down, but they exist so the audit log and stats are easy to read for grading.
 
 ## Setup and running
 
@@ -89,9 +108,10 @@ curl -s -X POST http://localhost:5000/submit \
 
 ## Detection signals
 
-The system uses two signals that look at genuinely different properties of the text. One
-reads meaning, the other measures shape. That is what makes combining them worth more
-than either alone: if they always agreed, the second one would be pointless.
+The system uses three signals that look at genuinely different properties of the text.
+One reads meaning, one measures shape, one matches a fixed vocabulary of known tells.
+That is what makes combining them worth more than any one alone: if they always agreed,
+the extra ones would be pointless.
 
 ### Signal 1: Groq LLM (semantic)
 
@@ -125,17 +145,34 @@ average.
   catches statistical uniformity without understanding the text at all.
 - What it misses: it has no idea what the text says, it is unreliable on short pieces (so
   the signal stays neutral at 0.5 under 30 words or 2 sentences), and it misreads
-  deliberately uniform human writing like formal prose or repetitive poetry as AI. That is
-  why it carries less weight than the LLM.
+  deliberately uniform human writing like formal prose or repetitive poetry as AI.
 
-### Combining them
+### Signal 3: Lexical AI markers (added as the ensemble stretch)
+
+A fixed vocabulary of phrases and words that show up far more often in AI writing than in
+casual human writing, like "it is important to note", "a testament to", "delve into",
+"furthermore", and "studies show". It counts how many distinct markers appear and maps
+that to a 0 to 1 score.
+
+- What it measures: the presence of specific known AI tells, nothing else.
+- Why I chose it: it is a completely different lens from the other two. It does not read
+  meaning and it does not measure distribution shape, it just matches a lexicon.
+- What it misses: it is high precision but low recall. When a marker is present that is
+  strong evidence, but plenty of AI text avoids these phrases, and some humans use them.
+  Because absence is only weak evidence, no markers scores 0 (leaning human), and this
+  signal carries the smallest weight.
+
+### Combining them (the ensemble vote)
 
 ```
-ai_likelihood = 0.65 * llm_score + 0.35 * stylometry_score
+ai_likelihood = 0.55 * llm_score + 0.25 * stylometry_score + 0.20 * lexical_score
 ```
 
-The LLM gets more weight because a holistic read is stronger evidence than surface
-statistics, and stylometry is the noisier of the two on real text.
+The LLM leads because a holistic read is the strongest evidence. Stylometry is next.
+Lexical markers get the smallest weight because they are high precision but sparse. The
+weights are renormalized over whichever signals are present, which is what makes the
+multi-modal case clean: for a short image caption, stylometry is skipped and the vote runs
+over the LLM and lexical signals only.
 
 ## Confidence scoring
 
@@ -165,19 +202,19 @@ I ran four inputs I chose on purpose (in [test_calibration.py](test_calibration.
 clearly AI, one clearly human, and two borderline cases. The test prints each signal
 separately so I can see which one drives the result. Final scores:
 
-| input | llm_score | stylometry_score | ai_likelihood | bucket |
-|---|---|---|---|---|
-| clearly AI essay | 0.80 | 0.627 | 0.739 | likely_ai |
-| clearly human (casual review) | 0.20 | 0.196 | 0.199 | likely_human |
-| borderline: formal human (economics) | 0.60 | 0.744 | 0.650 | uncertain |
-| borderline: lightly edited AI | 0.60 | 0.403 | 0.531 | uncertain |
+| input | llm | stylometry | lexical | ai_likelihood | bucket |
+|---|---|---|---|---|---|
+| clearly AI essay | 0.80 | 0.627 | 0.80 | 0.757 | likely_ai |
+| clearly human (casual review) | 0.20 | 0.196 | 0.00 | 0.159 | likely_human |
+| borderline: formal human (economics) | 0.60 | 0.744 | 0.00 | 0.516 | uncertain |
+| borderline: lightly edited AI | 0.60 | 0.403 | 0.40 | 0.511 | uncertain |
 
-This is what "meaningful" means to me: the clear cases sit 0.54 apart, all three buckets
-are reachable, and both borderline cases land in the middle instead of getting a confident
-verdict. The formal economics text is the important one. Both signals actually lean AI on
-it (stylometry 0.744, because formal academic writing really is uniform), but it still
-lands in `uncertain` rather than `likely_ai`, which is exactly the false positive the
-system is built to avoid.
+This is what "meaningful" means to me: the clear cases sit about 0.60 apart, all three
+buckets are reachable, and both borderline cases land in the middle instead of getting a
+confident verdict. The formal economics text is the important one. The stylometry signal
+actually leans AI on it (0.744, because formal academic writing really is uniform), but the
+LLM and lexical signals pull it back, so it lands in `uncertain` rather than `likely_ai`.
+That is exactly the false positive the system is built to avoid.
 
 ### Two example submissions
 
@@ -188,8 +225,9 @@ text:       "ok so i finally tried that new ramen place downtown and honestly?
              underwhelming. the broth was fine but they put WAY too much sodium..."
 llm_score:        0.2
 stylometry_score: 0.196
-ai_likelihood:    0.199
-confidence:       0.801
+lexical_score:    0.0
+ai_likelihood:    0.159
+confidence:       0.841
 attribution:      likely_human
 ```
 
@@ -201,13 +239,14 @@ text:       "I've been thinking a lot about remote work lately. There are genuin
              work-life boundaries on the other. Studies show productivity varies..."
 llm_score:        0.6
 stylometry_score: 0.403
-ai_likelihood:    0.531
-confidence:       0.531
+lexical_score:    0.4
+ai_likelihood:    0.511
+confidence:       0.511
 attribution:      uncertain
 ```
 
-The first is a confident human call at 0.801. The second is a lightly edited AI passage
-that sits almost on the fence at 0.531, so the system says it cannot tell rather than
+The first is a confident human call at 0.841. The second is a lightly edited AI passage
+that sits almost on the fence at 0.511, so the system says it cannot tell rather than
 guessing. Same pipeline, very different confidence, which is the whole idea.
 
 ## Transparency label
@@ -236,8 +275,10 @@ purpose, because a confident figure on an inconclusive result would send the wro
 > are not labeling it either way. Please treat this as inconclusive rather than a verdict.
 
 `{confidence}` is filled in at runtime. For example the clearly human ramen review above
-renders as "rated it about 80% likely to be written by a person," and the clearly AI essay
-renders as "about 74% likely to be machine written."
+renders as "rated it about 84% likely to be written by a person," and the clearly AI essay
+renders as "about 76% likely to be machine written." When the creator holds a verified
+human credential (see stretch features), one more sentence is appended: "The creator of
+this piece holds a verified human credential."
 
 ## Appeals workflow
 
@@ -247,7 +288,7 @@ A creator who thinks the classification is wrong sends `POST /appeal` with the
 1. Looks up the original decision by content_id (returns 404 if it does not exist).
 2. Sets that content's status to `under_review`.
 3. Writes an appeal row to the audit log carrying the reasoning and pointing back at the
-   original decision (its attribution, confidence, and both signal scores).
+   original decision (its attribution, confidence, and all three signal scores).
 4. Returns a confirmation with an appeal_id and the new status.
 
 There is no automatic re-classification. An appeal flags the item for a human, it does not
@@ -284,9 +325,6 @@ status codes: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 429, 429]
 200 count: 10   429 count: 2
 ```
 
-Reproduce against a running server with the loop from the project brief, or run the
-included check in a fresh process.
-
 ## Audit log
 
 Every classification and every appeal is written as one structured row in SQLite (see
@@ -302,56 +340,64 @@ it points at (id 3).
     {
       "id": 4,
       "event": "appeal",
-      "content_id": "b61da1cd-3146-4911-b342-f86c43f2dd49",
+      "content_id": "7ad761f2-7d88-4ef3-add9-8ea164f4cb7c",
       "creator_id": "econ_lena",
-      "timestamp": "2026-07-01T05:56:47.701Z",
+      "content_type": "text",
+      "timestamp": "2026-07-01T06:09:48.320Z",
       "attribution": "uncertain",
-      "ai_likelihood": 0.65,
-      "confidence": 0.65,
+      "ai_likelihood": 0.516,
+      "confidence": 0.516,
       "llm_score": 0.6,
       "stylometry_score": 0.744,
+      "lexical_score": 0.0,
       "status": "under_review",
       "appeal_reasoning": "This is my own analysis for a graduate economics seminar. English is my second language and my academic style reads as formal."
     },
     {
       "id": 3,
       "event": "classification",
-      "content_id": "b61da1cd-3146-4911-b342-f86c43f2dd49",
+      "content_id": "7ad761f2-7d88-4ef3-add9-8ea164f4cb7c",
       "creator_id": "econ_lena",
-      "timestamp": "2026-07-01T05:56:47.417Z",
+      "content_type": "text",
+      "timestamp": "2026-07-01T06:09:47.704Z",
       "attribution": "uncertain",
-      "ai_likelihood": 0.65,
-      "confidence": 0.65,
+      "ai_likelihood": 0.516,
+      "confidence": 0.516,
       "llm_score": 0.6,
       "stylometry_score": 0.744,
+      "lexical_score": 0.0,
       "status": "classified",
       "appeal_reasoning": null
     },
     {
       "id": 2,
       "event": "classification",
-      "content_id": "98b9fd51-f966-482d-a12f-b27dc04a46a0",
+      "content_id": "f12c7ecc-4354-4c3a-96c7-1b3d9c42bda6",
       "creator_id": "writer_jon",
-      "timestamp": "2026-07-01T05:56:47.137Z",
+      "content_type": "text",
+      "timestamp": "2026-07-01T06:09:46.112Z",
       "attribution": "likely_human",
-      "ai_likelihood": 0.199,
-      "confidence": 0.801,
+      "ai_likelihood": 0.159,
+      "confidence": 0.841,
       "llm_score": 0.2,
       "stylometry_score": 0.196,
+      "lexical_score": 0.0,
       "status": "classified",
       "appeal_reasoning": null
     },
     {
       "id": 1,
       "event": "classification",
-      "content_id": "43800d0f-29d6-41de-9351-2592f93c6d9a",
+      "content_id": "8c1306a9-139d-40fa-8693-8143bfda1dd8",
       "creator_id": "poet_maya",
-      "timestamp": "2026-07-01T05:56:46.432Z",
+      "content_type": "text",
+      "timestamp": "2026-07-01T06:09:45.542Z",
       "attribution": "likely_ai",
-      "ai_likelihood": 0.739,
-      "confidence": 0.739,
+      "ai_likelihood": 0.757,
+      "confidence": 0.757,
       "llm_score": 0.8,
       "stylometry_score": 0.627,
+      "lexical_score": 0.8,
       "status": "classified",
       "appeal_reasoning": null
     }
@@ -359,9 +405,80 @@ it points at (id 3).
 }
 ```
 
-Each row carries the timestamp, content id, creator, attribution, confidence, both
-individual signal scores, the combined likelihood, the status, and the appeal reasoning
-when there is one.
+Each row carries the timestamp, content id, creator, content type, attribution, confidence,
+all three individual signal scores, the combined likelihood, the status, and the appeal
+reasoning when there is one.
+
+## Stretch features
+
+All four are built and working.
+
+### 1. Ensemble detection (three signals)
+
+The pipeline uses three signals instead of two: the Groq LLM, stylometry, and the lexical
+AI marker detector described above. They are combined with a documented weighted vote,
+`0.55*llm + 0.25*stylometry + 0.20*lexical`, renormalized over the signals that apply. The
+lexical signal earns its keep in the calibration table: it pushes the clearly AI essay up
+to 0.757 (it hits "it is important to note" and "furthermore") and nudges the lightly
+edited AI passage up with "studies show," while staying silent on both human texts so it
+never accuses them.
+
+### 2. Provenance certificate (verified human credential)
+
+A creator can earn a verified human credential and it shows on their content.
+
+- `POST /verify/start` with a `creator_id` returns a random writing prompt and a
+  `challenge_id`.
+- `POST /verify/complete` with the `creator_id`, `challenge_id`, and their written response
+  runs that response through the detection pipeline. If it reads as clearly human, the
+  system grants a certificate (a `certificate_id` stored against the creator). If it reads
+  AI, it is denied with the score and they can try again. A challenge can only be used once.
+- Once verified, every `/submit` response for that creator carries `creator_verified: true`
+  and the transparency label gains the line "The creator of this piece holds a verified
+  human credential." `GET /creator/<creator_id>` returns the credential status.
+- Honest limit: this proves the creator can produce human reading writing on demand, not
+  that any specific later piece is theirs. It is a trust signal, not proof.
+
+Example: a creator wrote a casual few sentences about a burned breakfast for their
+challenge (ai_likelihood 0.235, likely_human) and earned the credential. A response full of
+AI cliches ("a testament to the rich tapestry of nature. Furthermore...") scored 0.829 and
+was correctly denied.
+
+### 3. Analytics dashboard
+
+`GET /analytics` returns JSON, and `GET /dashboard` renders it as a plain server side HTML
+page (simple bars, no JavaScript). It shows the attribution breakdown across the three
+buckets, the appeal rate (appeals over classifications), average confidence, the average
+score per signal, a breakdown by content type, and the number of verified human creators
+(the extra metric). Example `/analytics` output:
+
+```json
+{
+  "total_submissions": 3,
+  "by_attribution": { "likely_ai": 0, "uncertain": 1, "likely_human": 2 },
+  "by_content_type": { "image_caption": 2, "text": 1 },
+  "appeals": 0,
+  "appeal_rate": 0.0,
+  "avg_confidence": 0.76,
+  "avg_ai_likelihood": 0.298,
+  "avg_signal_scores": { "llm": 0.367, "stylometry": 0.5, "lexical": 0.0 },
+  "verified_human_creators": 1
+}
+```
+
+### 4. Multi-modal support
+
+`POST /submit` takes an optional `content_type`, either `text` (the default) or
+`image_caption` for an alt text or caption. Captions are short, so the stylometry signal is
+skipped (it needs length to be reliable) and the weighted vote renormalizes over the LLM
+and lexical signals. The LLM also switches to a caption specific prompt, since the tells are
+different: AI captions tend to be generic and describe the obvious, human captions tend to
+be specific or offhand. Everything downstream (label, appeal, log, analytics) treats both
+types the same, with `content_type` recorded on every row.
+
+Example: the generic caption "A serene landscape featuring a majestic mountain range under
+a clear blue sky" scored 0.587 (uncertain), while "my kid's science fair volcano, took
+third, he is furious lol" scored 0.073 (likely_human, 93% confidence).
 
 ## Known limitations
 
@@ -377,15 +494,17 @@ properties of the signals.
   below the LLM and why the AI threshold is set conservatively.
 
 - **Formal or academic human writing, including from non native English speakers.** The
-  economics example in the calibration table is real: both signals lean AI on it because
-  careful, even, textbook style prose reads as too clean to the LLM and as uniform to
-  stylometry. The 0.70 threshold catches many of these in the uncertain band instead of
-  accusing them, and the appeal path exists for the rest, but the system genuinely cannot
-  distinguish polished human prose from AI with confidence. That is an honest limit, not a
-  bug I can tune away.
+  economics example in the calibration table is real: the stylometry signal leans AI on it
+  because careful, even, textbook style prose reads as uniform. The 0.70 threshold and the
+  LLM pulling the other way catch many of these in the uncertain band instead of accusing
+  them, and the appeal path exists for the rest, but the system genuinely cannot distinguish
+  polished human prose from AI with confidence. That is an honest limit, not a bug I can
+  tune away.
 
-- **No auth on appeals.** Anyone with a content_id can file an appeal or read the log.
-  Fine for this project, not for production.
+- **No auth anywhere.** Anyone with a content_id can appeal, anyone can read the log or the
+  dashboard, and the verified human credential proves willingness and ability to write
+  human text on demand, not authorship of any later piece. Fine for this project, not for
+  production.
 
 ## Spec reflection
 
@@ -432,13 +551,13 @@ instances where I had to revise or override what it produced:
 ## Project structure
 
 ```
-app.py               Flask app: /submit, /appeal, /log, rate limiting
-signals.py           Signal 1 (Groq LLM) and Signal 2 (stylometry)
-scoring.py           combine_signals, attribution buckets, confidence
-labels.py            the three transparency label variants
-db.py                SQLite storage: submissions table + audit_log
+app.py               Flask app: submit, appeal, log, verify, creator, analytics, dashboard
+signals.py           Signal 1 (Groq LLM), Signal 2 (stylometry), Signal 3 (lexical markers)
+scoring.py           combine_signals (weighted vote), attribution buckets, confidence
+labels.py            the three transparency label variants, plus the credential line
+db.py                SQLite storage: submissions, audit_log, creators, challenges, analytics
 test_signal.py       manual check of Signal 1 alone
-test_calibration.py  four input calibration of the full pipeline
-planning.md          the spec, written before the code
+test_calibration.py  four input calibration of the full three signal pipeline
+planning.md          the spec, written before the code, with the stretch designs
 requirements.txt
 ```

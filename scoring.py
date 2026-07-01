@@ -1,26 +1,36 @@
 """Confidence scoring.
 
 Turns an AI likelihood (0..1) into an attribution bucket and a confidence number.
-The buckets use asymmetric thresholds on purpose: it takes stronger evidence (0.75)
+The buckets use asymmetric thresholds on purpose: it takes stronger evidence (0.70)
 to call something AI than to call it human (0.40). On a creative platform, falsely
-accusing a real writer is the worst outcome, so the system leans toward not
-accusing when the evidence is thin.
+accusing a real writer is the worst outcome, so the system leans toward not accusing
+when the evidence is thin.
 
-The AI likelihood itself is the weighted mix of the two signals (combine_signals).
-The LLM carries more weight because a holistic read is stronger evidence than
-surface statistics, and stylometry is the noisier of the two on real text.
+The AI likelihood is a weighted vote across the detection signals (combine_signals).
+The LLM leads because a holistic read is stronger evidence than surface statistics.
+The lexical marker signal is smallest because it is high precision but low recall.
 """
 
 AI_THRESHOLD = 0.70
 HUMAN_THRESHOLD = 0.40
 
-LLM_WEIGHT = 0.65
-STYLOMETRY_WEIGHT = 0.35
+# Ensemble weights. Renormalized over whichever signals are present, so dropping
+# stylometry for a short caption still produces a valid weighted vote.
+WEIGHTS = {"llm": 0.55, "stylometry": 0.25, "lexical": 0.20}
 
 
-def combine_signals(p_llm, p_style):
-    """Weighted mix of the two signal scores into one AI likelihood (0..1)."""
-    return round(LLM_WEIGHT * p_llm + STYLOMETRY_WEIGHT * p_style, 3)
+def combine_signals(scores):
+    """Weighted vote into one AI likelihood (0..1).
+
+    scores is a dict of signal name -> score (0..1), or None if a signal did not
+    apply (for example stylometry on a short caption). Weights are renormalized over
+    the signals that are present.
+    """
+    present = {k: v for k, v in scores.items() if v is not None}
+    total_w = sum(WEIGHTS[k] for k in present)
+    if total_w == 0:
+        return 0.5
+    return round(sum(present[k] * WEIGHTS[k] for k in present) / total_w, 3)
 
 
 def attribution_from_likelihood(ai_likelihood):
